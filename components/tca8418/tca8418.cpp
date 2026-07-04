@@ -115,24 +115,21 @@ void TCA8418Component::setup() {
 }
 
 void TCA8418Component::loop() {
-  // Poll the event FIFO every loop instead of relying solely on the INT edge.
-  // The low nibble of KEY_LCK_EC (0x03) is the number of queued key events;
-  // an edge can be missed (or the INT can stay asserted low), which was the
-  // cause of intermittent/dropped key presses. Polling reads whatever is queued.
+  // Poll the key-event FIFO directly rather than relying on the INT edge (a
+  // missed edge was the cause of intermittent/dropped presses). Reading
+  // KEY_EVENT_A (0x04) returns 0 when the FIFO is empty and pops the next event
+  // otherwise, so we don't need to trust the INT_STAT or KEY_LCK_EC registers.
+  // Throttle to ~10 ms so we don't saturate the shared I2C bus every loop.
+  const uint32_t now = millis();
+  if (now - this->last_poll_ < 10)
+    return;
+  this->last_poll_ = now;
   this->store_.int_received = false;
 
-  uint8_t lck_ec;
-  if (!this->read_byte(TCA8418_REGISTER_KEY_LCK_EC, &lck_ec)) {
-    ESP_LOGW(TAG, "Failed to read KEY_LCK_EC register.");
-    this->status_set_warning();
-    return;
-  }
-  if ((lck_ec & TCA8418_EVENT_COUNT_MASK) == 0)
-    return;  // no key events queued
-
-  //  Drain the FIFO: read KEY_EVENT_A (0x04) until it returns 0 (empty).
   uint8_t key;
+  bool got_event = false;
   while (this->read_byte(TCA8418_REGISTER_KEY_EVENT_FIFO, &key) && (key != 0)) {
+    got_event = true;
     //  bit 7: 0 = key released, 1 = key pressed; bits 6-0 are the keycode.
     ESP_LOGD(TAG, "Key event: %d", key);
     if ((key & TCA8418_KEY_STATUS_MASK) == 0) {
@@ -144,13 +141,11 @@ void TCA8418Component::loop() {
     }
   }
 
-  //  Clear the key-event interrupt flag by writing a 1 to it.
-  if (!this->write_byte(TCA8418_REGISTER_INT_STAT, TCA8418_INT_STATUS_BIT_KEY)) {
-    ESP_LOGW(TAG, "Failed to clear interrupt status bit.");
-    this->status_set_warning();
-    return;
+  if (got_event) {
+    //  Clear the key-event interrupt flag by writing a 1 to it.
+    this->write_byte(TCA8418_REGISTER_INT_STAT, TCA8418_INT_STATUS_BIT_KEY);
+    this->status_clear_warning();
   }
-  this->status_clear_warning();
 }
 
 void TCA8418Component::dump_config() {

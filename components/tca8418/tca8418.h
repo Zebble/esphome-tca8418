@@ -38,6 +38,7 @@ class TCA8418Component : public key_provider::KeyProvider, public Component, pub
   protected:
     uint16_t prev_config_{0};
     InternalGPIOPin *interrupt_pin_;
+    uint32_t last_poll_{0};
 
     TCA8418Interrupt store_;
 

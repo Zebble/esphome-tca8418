@@ -115,51 +115,42 @@ void TCA8418Component::setup() {
 }
 
 void TCA8418Component::loop() {
-  if (this->store_.int_received) {
-    //Interrupt recieved, read key presses
-    //  Read INT_STAT (0x02) register to find out the type of int
-    uint8_t int_stat;
-    if (!this->read_byte(TCA8418_REGISTER_INT_STAT, &int_stat)) {
-      ESP_LOGW(TAG, "Failed to read INT_STAT register.");
-      this->status_set_warning();
-      return;
-    }
-    //     If K_INT bit set, then key is in FIFO
-    if (int_stat & TCA8418_INT_STATUS_BIT_KEY) {
-      uint8_t key;
-      ESP_LOGD(TAG, "Key event interrupt.");
-    //  Read the KEY_EVENT_A (0x04) register for key event
-    //  Repeat read of KEY_EVENT_A register until = 0, 0 means FIFO empty
-      while (this->read_byte(TCA8418_REGISTER_KEY_EVENT_FIFO, &key) && (key != 0)) {
-    //    bit 7: 0 = key released,  1 = key pressed
-        ESP_LOGD(TAG, "Key event: %d", key);
-        if ((key & TCA8418_KEY_STATUS_MASK) == 0) {
-          //key released
-          for (auto &listener : this->button_listeners_)
-            listener->key_released(key);
-        } else {
-          //key pressed
-          for (auto &listener : this->button_listeners_)
-            listener->key_pressed(key & ~TCA8418_KEY_STATUS_MASK);
-        }
-      }
-    //  Reset INT_STAT flag by writing a 1 to the bit
-    if (!this->write_byte(TCA8418_REGISTER_INT_STAT, TCA8418_INT_STATUS_BIT_KEY)) {
-      ESP_LOGW(TAG, "Failed to clear interrupt status bit.");
-      this->status_set_warning();
-      return;
-    }
-    } else {
-      // unknown or unsupported interrupt.
-      ESP_LOGW(TAG, "Unknown or unsupported interrupt detected.");
-      if (!this->write_byte(TCA8418_REGISTER_INT_STAT, 0xFF)) {
-        ESP_LOGW(TAG, "Failed to clear all interrupt stats bits.");
-        this->status_set_warning();
-        return;
-      }
-    }
-    this->store_.int_received = false;
+  // Poll the event FIFO every loop instead of relying solely on the INT edge.
+  // The low nibble of KEY_LCK_EC (0x03) is the number of queued key events;
+  // an edge can be missed (or the INT can stay asserted low), which was the
+  // cause of intermittent/dropped key presses. Polling reads whatever is queued.
+  this->store_.int_received = false;
+
+  uint8_t lck_ec;
+  if (!this->read_byte(TCA8418_REGISTER_KEY_LCK_EC, &lck_ec)) {
+    ESP_LOGW(TAG, "Failed to read KEY_LCK_EC register.");
+    this->status_set_warning();
+    return;
   }
+  if ((lck_ec & TCA8418_EVENT_COUNT_MASK) == 0)
+    return;  // no key events queued
+
+  //  Drain the FIFO: read KEY_EVENT_A (0x04) until it returns 0 (empty).
+  uint8_t key;
+  while (this->read_byte(TCA8418_REGISTER_KEY_EVENT_FIFO, &key) && (key != 0)) {
+    //  bit 7: 0 = key released, 1 = key pressed; bits 6-0 are the keycode.
+    ESP_LOGD(TAG, "Key event: %d", key);
+    if ((key & TCA8418_KEY_STATUS_MASK) == 0) {
+      for (auto &listener : this->button_listeners_)
+        listener->key_released(key & ~TCA8418_KEY_STATUS_MASK);
+    } else {
+      for (auto &listener : this->button_listeners_)
+        listener->key_pressed(key & ~TCA8418_KEY_STATUS_MASK);
+    }
+  }
+
+  //  Clear the key-event interrupt flag by writing a 1 to it.
+  if (!this->write_byte(TCA8418_REGISTER_INT_STAT, TCA8418_INT_STATUS_BIT_KEY)) {
+    ESP_LOGW(TAG, "Failed to clear interrupt status bit.");
+    this->status_set_warning();
+    return;
+  }
+  this->status_clear_warning();
 }
 
 void TCA8418Component::dump_config() {
